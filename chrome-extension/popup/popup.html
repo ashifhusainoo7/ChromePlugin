@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meet Sentiment Bot</title>
+    <link rel="stylesheet" href="../assets/css/popup.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="header">
+        <div class="logo">
+            <i class="fas fa-robot"></i>
+            <h1>Meet Sentiment Bot</h1>
+        </div>
+        <div class="status-indicator" id="connectionStatus">
+            <span class="status-dot offline"></span>
+            <span class="status-text">Offline</span>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <!-- Configuration Section -->
+        <div class="section">
+            <h3><i class="fas fa-cog"></i> Configuration</h3>
+            <div class="config-grid">
+                <div class="config-item">
+                    <label for="apiUrl">Backend URL:</label>
+                    <input type="url" id="apiUrl" placeholder="http://localhost:8000" value="http://localhost:8000">
+                </div>
+                <div class="config-item">
+                    <label for="emailAlert">Email Alerts:</label>
+                    <input type="email" id="emailAlert" placeholder="alerts@company.com">
+                </div>
+                <div class="config-item">
+                    <label for="sentimentThreshold">Sentiment Threshold:</label>
+                    <select id="sentimentThreshold">
+                        <option value="0.3">High Sensitivity</option>
+                        <option value="0.1" selected>Medium Sensitivity</option>
+                        <option value="-0.1">Low Sensitivity</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Meeting Controls -->
+        <div class="section">
+            <h3><i class="fas fa-video"></i> Meeting Controls</h3>
+            <div class="controls-grid">
+                <button id="startBot" class="btn btn-primary" disabled>
+                    <i class="fas fa-play"></i>
+                    Start Bot
+                </button>
+                <button id="stopBot" class="btn btn-secondary" disabled>
+                    <i class="fas fa-stop"></i>
+                    Stop Bot
+                </button>
+                <button id="testConnection" class="btn btn-info">
+                    <i class="fas fa-plug"></i>
+                    Test Connection
+                </button>
+                <button id="joinMeeting" class="btn btn-success" disabled>
+                    <i class="fas fa-sign-in-alt"></i>
+                    Join Meeting
+                </button>
+            </div>
+            
+            <div class="meeting-url-section">
+                <label for="meetingUrl">Meeting URL:</label>
+                <div class="url-input-group">
+                    <input type="url" id="meetingUrl" placeholder="https://meet.google.com/xxx-xxxx-xxx">
+                    <button id="detectMeeting" class="btn btn-outline">
+                        <i class="fas fa-search"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Real-time Status -->
+        <div class="section">
+            <h3><i class="fas fa-chart-line"></i> Real-time Status</h3>
+            <div class="status-grid">
+                <div class="status-card">
+                    <div class="status-value" id="currentSentiment">--</div>
+                    <div class="status-label">Current Sentiment</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-value" id="participantCount">--</div>
+                    <div class="status-label">Participants</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-value" id="sessionDuration">--</div>
+                    <div class="status-label">Duration</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-value" id="alertsTriggered">0</div>
+                    <div class="status-label">Alerts Sent</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Activity -->
+        <div class="section">
+            <h3><i class="fas fa-history"></i> Recent Activity</h3>
+            <div class="activity-log" id="activityLog">
+                <div class="activity-item">
+                    <span class="activity-time">--:--</span>
+                    <span class="activity-text">Bot ready to start</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Advanced Settings -->
+        <div class="section collapsible">
+            <h3 class="collapsible-header">
+                <i class="fas fa-tools"></i> Advanced Settings
+                <i class="fas fa-chevron-down toggle-icon"></i>
+            </h3>
+            <div class="collapsible-content">
+                <div class="advanced-settings">
+                    <div class="setting-item">
+                        <label>
+                            <input type="checkbox" id="autoJoin" checked>
+                            Auto-join detected meetings
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label>
+                            <input type="checkbox" id="muteOnJoin" checked>
+                            Mute microphone on join
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label>
+                            <input type="checkbox" id="disableVideo" checked>
+                            Disable video on join
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label>
+                            <input type="checkbox" id="enableLogging" checked>
+                            Enable detailed logging
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label for="recordingQuality">Recording Quality:</label>
+                        <select id="recordingQuality">
+                            <option value="low">Low (8kHz)</option>
+                            <option value="medium" selected>Medium (16kHz)</option>
+                            <option value="high">High (44kHz)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <div class="version">v1.0.0</div>
+        <div class="links">
+            <a href="#" id="openDashboard"><i class="fas fa-external-link-alt"></i> Dashboard</a>
+            <a href="#" id="openLogs"><i class="fas fa-file-alt"></i> Logs</a>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <div class="loading-text">Processing...</div>
+        </div>
+    </div>
+
+    <script src="../assets/js/jquery-3.7.1.min.js"></script>
+    <script src="../assets/js/popup.js"></script>
+</body>
+</html>
