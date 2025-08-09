@@ -1,188 +1,462 @@
-from __future__ import annotations
+"""
+Enterprise Google Meet Sentiment Analysis Bot - Main Application
+FastAPI backend with comprehensive API endpoints, middleware, and error handling
+"""
 
 import asyncio
-import json
-from collections import defaultdict, deque
-from typing import AsyncGenerator, Deque, Dict, Optional
+import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+from typing import Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import JSONResponse
+import structlog
+import uvicorn
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from loguru import logger
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer
+from prometheus_client import make_asgi_app, Counter, Histogram, generate_latest
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import PlainTextResponse
 
-from app.config import settings
-from app.logging_conf import configure_logging
-from app.models.sentiment import Alert, SentimentUpdate
+# Add the backend directory to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from app.core.config import get_settings
+from app.core.database import database, engine, metadata
+from app.core.redis import redis_client
+from app.core.logging import setup_logging
+from app.api.v1.api import api_router
+from app.core.exceptions import (
+    AppException,
+    ValidationException,
+    AuthenticationException,
+    AuthorizationException
+)
+from app.services.bot_manager import BotManager
+from app.services.sentiment_analyzer import SentimentAnalyzer
 from app.services.email_service import EmailService
-from app.services.sentiment_service import SentimentService, SentimentTrendTracker
-from app.services.stt_service import STTService
+
+# Initialize settings
+settings = get_settings()
+
+# Setup structured logging
+logger = setup_logging()
+
+# Metrics
+REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('http_request_duration_seconds', 'HTTP request latency')
 
 
-configure_logging()
-app = FastAPI(title="Meet Sentiment Backend", version="1.0.0")
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Middleware for collecting metrics"""
+    
+    async def dispatch(self, request: Request, call_next):
+        start_time = REQUEST_LATENCY.start_timer()
+        
+        try:
+            response = await call_next(request)
+            REQUEST_COUNT.labels(
+                method=request.method,
+                endpoint=request.url.path,
+                status=response.status_code
+            ).inc()
+            
+            return response
+        finally:
+            start_time.stop()
+
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware for request/response logging"""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Generate request ID
+        request_id = f"{id(request)}"
+        
+        # Log request
+        logger.info(
+            "Request started",
+            request_id=request_id,
+            method=request.method,
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_ip=request.client.host if request.client else None
+        )
+        
+        try:
+            response = await call_next(request)
+            
+            # Log response
+            logger.info(
+                "Request completed",
+                request_id=request_id,
+                status_code=response.status_code,
+                response_headers=dict(response.headers)
+            )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(
+                "Request failed",
+                request_id=request_id,
+                error=str(e),
+                exc_info=True
+            )
+            raise
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan management"""
+    
+    # Startup
+    logger.info("Starting up Google Meet Sentiment Bot API...")
+    
+    try:
+        # Initialize database
+        if settings.DATABASE_URL:
+            await database.connect()
+            logger.info("Database connected successfully")
+        
+        # Initialize Redis
+        if settings.REDIS_URL:
+            await redis_client.ping()
+            logger.info("Redis connected successfully")
+        
+        # Initialize services
+        app.state.bot_manager = BotManager()
+        app.state.sentiment_analyzer = SentimentAnalyzer()
+        app.state.email_service = EmailService()
+        
+        logger.info("All services initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Startup failed: {str(e)}", exc_info=True)
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down Google Meet Sentiment Bot API...")
+    
+    try:
+        # Cleanup bot manager
+        if hasattr(app.state, 'bot_manager'):
+            await app.state.bot_manager.cleanup_all()
+        
+        # Disconnect database
+        if database.is_connected:
+            await database.disconnect()
+            logger.info("Database disconnected")
+        
+        # Close Redis connection
+        if redis_client:
+            await redis_client.close()
+            logger.info("Redis disconnected")
+            
+        logger.info("Shutdown completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Shutdown error: {str(e)}", exc_info=True)
+
+
+# Create FastAPI application
+app = FastAPI(
+    title="Google Meet Sentiment Analysis Bot",
+    description="Enterprise-grade automated meeting assistant with real-time sentiment analysis",
+    version="1.0.0",
+    docs_url="/docs" if settings.DEBUG else None,
+    redoc_url="/redoc" if settings.DEBUG else None,
+    openapi_url="/openapi.json" if settings.DEBUG else None,
+    lifespan=lifespan
+)
+
+# Security
+security = HTTPBearer()
+
+# Add middleware (order matters!)
+if settings.TRUSTED_HOSTS:
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=settings.TRUSTED_HOSTS.split(",")
+    )
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-email_service = EmailService()
-sentiment_service = SentimentService()
+app.add_middleware(MetricsMiddleware)
+app.add_middleware(LoggingMiddleware)
 
 
-class StreamState:
-    def __init__(self, meeting_id: str, sample_rate_hz: int) -> None:
-        self.meeting_id = meeting_id
-        self.sample_rate_hz = sample_rate_hz
-        self.buffer: Deque[bytes] = deque()
-        self.closed = False
-        self.tracker = SentimentTrendTracker(window_seconds=max(60, settings.sentiment_neg_duration_sec))
-
-    def append(self, data: bytes) -> None:
-        self.buffer.append(data)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-streams: Dict[str, StreamState] = {}
-
-
-async def _pcm_generator(meeting_id: str) -> AsyncGenerator[bytes, None]:
-    state = streams[meeting_id]
-    while not state.closed or state.buffer:
-        if not state.buffer:
-            await asyncio.sleep(0.01)
-            continue
-        data = state.buffer.popleft()
-        yield data
-
-
-@app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
-
-@app.post("/api/join")
-async def api_join(payload: dict) -> JSONResponse:
-    meeting_url = payload.get("meeting_url")
-    if not meeting_url:
-        raise HTTPException(status_code=400, detail="meeting_url required")
-
-    # Lazy import to avoid UC overhead on startup
-    from app.services.meet_bot import MeetBot
-
-    bot = MeetBot(
-        profile_dir=settings.chrome_profile_path,
-        chrome_binary=settings.chrome_binary_path,
-        extension_path=settings.extension_path,
+# Exception handlers
+@app.exception_handler(AppException)
+async def app_exception_handler(request: Request, exc: AppException):
+    """Handle custom application exceptions"""
+    logger.error(
+        "Application exception",
+        error=str(exc),
+        error_code=exc.error_code,
+        status_code=exc.status_code,
+        url=str(request.url)
+    )
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.error_code,
+                "message": str(exc),
+                "details": exc.details
+            }
+        }
     )
 
-    asyncio.get_event_loop().run_in_executor(None, bot.join, meeting_url)
-    return JSONResponse({"status": "joining"})
+
+@app.exception_handler(ValidationException)
+async def validation_exception_handler(request: Request, exc: ValidationException):
+    """Handle validation exceptions"""
+    logger.warning(
+        "Validation error",
+        error=str(exc),
+        validation_errors=exc.details,
+        url=str(request.url)
+    )
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Input validation failed",
+                "details": exc.details
+            }
+        }
+    )
 
 
-@app.websocket("/ws/audio-stream")
-async def ws_audio_stream(ws: WebSocket):
-    await ws.accept()
-    meeting_id: Optional[str] = None
-    sample_rate = settings.stt_sample_rate_hz
+@app.exception_handler(AuthenticationException)
+async def auth_exception_handler(request: Request, exc: AuthenticationException):
+    """Handle authentication exceptions"""
+    logger.warning(
+        "Authentication error",
+        error=str(exc),
+        url=str(request.url)
+    )
+    
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "code": "AUTHENTICATION_ERROR",
+                "message": "Authentication required"
+            }
+        }
+    )
 
+
+@app.exception_handler(AuthorizationException)
+async def authorization_exception_handler(request: Request, exc: AuthorizationException):
+    """Handle authorization exceptions"""
+    logger.warning(
+        "Authorization error",
+        error=str(exc),
+        url=str(request.url)
+    )
+    
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": {
+                "code": "AUTHORIZATION_ERROR",
+                "message": "Insufficient permissions"
+            }
+        }
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions"""
+    logger.warning(
+        "HTTP exception",
+        status_code=exc.status_code,
+        detail=exc.detail,
+        url=str(request.url)
+    )
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": f"HTTP_{exc.status_code}",
+                "message": exc.detail
+            }
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions"""
+    logger.error(
+        "Unexpected error",
+        error=str(exc),
+        error_type=type(exc).__name__,
+        url=str(request.url),
+        exc_info=True
+    )
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "An unexpected error occurred"
+            }
+        }
+    )
+
+
+# Health check endpoints
+@app.get("/health")
+async def health_check():
+    """Basic health check"""
+    return {
+        "status": "healthy",
+        "version": "1.0.0",
+        "timestamp": logger.info("Health check requested")
+    }
+
+
+@app.get("/health/detailed")
+async def detailed_health_check():
+    """Detailed health check with service status"""
+    health_status = {
+        "status": "healthy",
+        "version": "1.0.0",
+        "services": {}
+    }
+    
+    # Check database
     try:
+        if database.is_connected:
+            health_status["services"]["database"] = "healthy"
+        else:
+            health_status["services"]["database"] = "disconnected"
+            health_status["status"] = "degraded"
+    except Exception as e:
+        health_status["services"]["database"] = f"error: {str(e)}"
+        health_status["status"] = "unhealthy"
+    
+    # Check Redis
+    try:
+        await redis_client.ping()
+        health_status["services"]["redis"] = "healthy"
+    except Exception as e:
+        health_status["services"]["redis"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+    
+    # Check bot manager
+    try:
+        if hasattr(app.state, 'bot_manager'):
+            bot_count = len(app.state.bot_manager.active_bots)
+            health_status["services"]["bot_manager"] = f"healthy ({bot_count} active bots)"
+        else:
+            health_status["services"]["bot_manager"] = "not initialized"
+    except Exception as e:
+        health_status["services"]["bot_manager"] = f"error: {str(e)}"
+    
+    return health_status
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return PlainTextResponse(generate_latest())
+
+
+# Include API routes
+app.include_router(api_router, prefix="/api/v1")
+
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """API root endpoint"""
+    return {
+        "message": "Google Meet Sentiment Analysis Bot API",
+        "version": "1.0.0",
+        "docs": "/docs" if settings.DEBUG else "Documentation not available in production",
+        "health": "/health"
+    }
+
+
+# WebSocket endpoint for real-time updates
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket, session_id: str):
+    """WebSocket endpoint for real-time session updates"""
+    await websocket.accept()
+    
+    try:
+        logger.info(f"WebSocket connection established for session: {session_id}")
+        
+        # Add client to session
+        if hasattr(app.state, 'bot_manager'):
+            await app.state.bot_manager.add_websocket_client(session_id, websocket)
+        
+        # Keep connection alive
         while True:
-            message = await ws.receive()
-            if "text" in message and message["text"]:
-                try:
-                    data = json.loads(message["text"])  # control frames
-                except json.JSONDecodeError:
-                    continue
-                msg_type = data.get("type")
-                if msg_type == "start":
-                    meeting_id = data.get("meeting_id")
-                    sample_rate = int(data.get("sample_rate_hz", sample_rate))
-                    if not meeting_id:
-                        await ws.close(code=1008)
-                        return
-                    streams[meeting_id] = StreamState(meeting_id, sample_rate)
-
-                    async def run_stt():
-                        try:
-                            async for result in _stream_stt(meeting_id, sample_rate):
-                                await ws.send_text(json.dumps(result))
-                        except Exception as exc:
-                            logger.exception(f"STT loop error: {exc}")
-
-                    asyncio.create_task(run_stt())
-                elif msg_type == "stop" and meeting_id:
-                    state = streams.get(meeting_id)
-                    if state:
-                        state.close()
-                else:
-                    # ignore unknown control
-                    pass
-            elif "bytes" in message and message["bytes"]:
-                if not meeting_id:
-                    # ignore data before start
-                    continue
-                state = streams.get(meeting_id)
-                if not state:
-                    continue
-                state.append(message["bytes"])
-    except WebSocketDisconnect:
-        pass
+            try:
+                # Wait for client messages or send heartbeat
+                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                await websocket.send_text('{"type": "heartbeat"}')
+            
+    except Exception as e:
+        logger.error(f"WebSocket error for session {session_id}: {str(e)}")
+    
     finally:
-        if meeting_id and meeting_id in streams:
-            streams[meeting_id].close()
-            del streams[meeting_id]
+        if hasattr(app.state, 'bot_manager'):
+            await app.state.bot_manager.remove_websocket_client(session_id, websocket)
+        
+        logger.info(f"WebSocket connection closed for session: {session_id}")
 
 
-async def _stream_stt(meeting_id: str, sample_rate: int):
-    state = streams[meeting_id]
+# Dependency injection helpers
+def get_bot_manager() -> BotManager:
+    """Get bot manager instance"""
+    return app.state.bot_manager
 
-    async def gen():
-        async for chunk in _pcm_generator(meeting_id):
-            yield chunk
 
-    loop = asyncio.get_event_loop()
+def get_sentiment_analyzer() -> SentimentAnalyzer:
+    """Get sentiment analyzer instance"""
+    return app.state.sentiment_analyzer
 
-    def blocking_iter():
-        # Bridge async -> sync generator for Vosk
-        async_gen = gen()
-        try:
-            while True:
-                chunk = asyncio.run_coroutine_threadsafe(async_gen.__anext__(), loop).result()
-                yield chunk
-        except StopAsyncIteration:
-            return
 
-    for stt_result in STTService.stream_recognize(blocking_iter(), sample_rate):
-        s = sentiment_service.analyze_text(stt_result.text)
-        state.tracker.add(s.compound)
-        avg = state.tracker.average()
-        payload = SentimentUpdate(
-            meeting_id=meeting_id,
-            text=stt_result.text,
-            is_final=stt_result.is_final,
-            compound=s.compound,
-            label=s.label,
-            avg_compound=avg,
-        ).model_dump()
-        payload["type"] = "sentiment_update"
-        yield payload
+def get_email_service() -> EmailService:
+    """Get email service instance"""
+    return app.state.email_service
 
-        if state.tracker.sustained_negative(
-            threshold=settings.sentiment_neg_threshold,
-            duration_sec=settings.sentiment_neg_duration_sec,
-        ):
-            subject = f"Negative sentiment alert: {meeting_id}"
-            html = f"""
-            <h3>Negative Sentiment Detected</h3>
-            <p>Meeting: {meeting_id}</p>
-            <p>Average compound: {avg:.3f}</p>
-            """
-            email_service.send_alert(subject, html)
-            # avoid spamming: wait a bit before next alert window
-            await asyncio.sleep(settings.sentiment_neg_duration_sec)
+
+if __name__ == "__main__":
+    # Run with uvicorn for development
+    uvicorn.run(
+        "main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.DEBUG,
+        log_level="info",
+        access_log=True
+    )
