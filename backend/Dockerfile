@@ -1,86 +1,87 @@
-# Multi-stage build for production optimization
-FROM python:3.11-slim as base
+# ===== Base image (light) =====
+FROM python:3.11-slim AS base
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
+# Minimal deps for local dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    ffmpeg \
     git \
-    libpq-dev \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
+# Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
-
-# Set work directory
 WORKDIR /app
 
-# Install Chrome for Selenium
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - && \
-    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google.list && \
-    apt-get update && apt-get install -y google-chrome-stable && \
-    rm -rf /var/lib/apt/lists/*
+# ===== Development (super fast) =====
+FROM base AS development
 
-# Development stage
-FROM base as development
-
-# Install development dependencies
-COPY requirements.txt .
-RUN pip install --upgrade pip && \
+COPY requirements.txt requirements.txt
+# Use pip cache for faster rebuilds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
     pip install -r requirements.txt && \
     pip install pytest pytest-asyncio pytest-cov black isort flake8 mypy
 
-# Copy application code
+# Copy source code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p logs uploads /tmp/chrome-user-data && \
-    chown -R appuser:appuser /app logs uploads /tmp/chrome-user-data
+# Create dirs
+RUN mkdir -p logs uploads && \
+    chown -R appuser:appuser /app logs uploads
 
 USER appuser
 
 EXPOSE 8000
-
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
-# Production stage
-FROM base as production
+# ===== Production (heavy) =====
+FROM python:3.11-slim AS production
 
-# Install only production dependencies
-COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install --no-dev -r requirements.txt && \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install heavy system deps here ONLY for prod
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ffmpeg \
+    libpq-dev \
+    wget \
+    curl \
+    git \
+    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - && \
+    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google.list && \
+    apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+
+COPY requirements.txt requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install -r requirements.txt && \
     pip install gunicorn[gevent]
 
-# Copy application code
 COPY . .
 
-# Create necessary directories with proper permissions
 RUN mkdir -p logs uploads /tmp/chrome-user-data && \
     chown -R appuser:appuser /app logs uploads /tmp/chrome-user-data
 
-# Remove unnecessary files for production
+# Cleanup
 RUN find . -type f -name "*.pyc" -delete && \
     find . -type d -name "__pycache__" -delete && \
     rm -rf tests/ .pytest_cache/ .git/
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
 USER appuser
-
 EXPOSE 8000
 
-# Production command with Gunicorn
 CMD ["gunicorn", "app.main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "4", \
@@ -93,5 +94,5 @@ CMD ["gunicorn", "app.main:app", \
      "--error-logfile", "-", \
      "--log-level", "info"]
 
-# Final stage selector
-FROM ${BUILD_ENV:-production} as final
+# ===== Final stage selector =====
+FROM ${BUILD_ENV:-development} AS final
